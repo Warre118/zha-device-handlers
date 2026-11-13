@@ -532,6 +532,7 @@ class HikingPowerMeter(TuyaSwitch):
         }
     }
 
+
 class TuyaDINPowerMeasurement(ElectricalMeasurement, TuyaLocalCluster):
     """Electrical measurements reported by the _TZE204_cjbofhxw DIN meter.
 
