@@ -87,7 +87,12 @@ def _kelvin_range_to_mireds(warmest_k: Any, coldest_k: Any) -> tuple[int, int]:
 
 
 class GledoptoColorRangeConfigCluster(LocalDataCluster):
-    """Local cluster holding the color temperature range of the LED strip."""
+    """Local cluster holding the color temperature range of the LED strip.
+
+    The attributes of the local clusters never reach the device. They have no
+    manufacturer code, so they are stored and restored by zigpy like standard
+    attributes.
+    """
 
     cluster_id: t.uint16_t = 0xFC01
     name: str = "GLEDOPTO Color Range Config"
@@ -96,8 +101,12 @@ class GledoptoColorRangeConfigCluster(LocalDataCluster):
     class AttributeDefs(BaseAttributeDefs):
         """Attribute definitions."""
 
-        warmest_k: Final = ZCLAttributeDef(id=0x0000, type=t.uint16_t)
-        coldest_k: Final = ZCLAttributeDef(id=0x0001, type=t.uint16_t)
+        warmest_k: Final = ZCLAttributeDef(
+            id=0x0000, type=t.uint16_t, manufacturer_code=None
+        )
+        coldest_k: Final = ZCLAttributeDef(
+            id=0x0001, type=t.uint16_t, manufacturer_code=None
+        )
 
     _DEFAULT_VALUES = {
         AttributeDefs.warmest_k.id: DEFAULT_WARMEST_K,
@@ -123,7 +132,9 @@ class GledoptoColorLoopConfigCluster(LocalDataCluster):
     class AttributeDefs(BaseAttributeDefs):
         """Attribute definitions."""
 
-        color_loop_time: Final = ZCLAttributeDef(id=0x0000, type=t.uint16_t)
+        color_loop_time: Final = ZCLAttributeDef(
+            id=0x0000, type=t.uint16_t, manufacturer_code=None
+        )
 
     _DEFAULT_VALUES = {
         AttributeDefs.color_loop_time.id: COLOR_LOOP_DEFAULT_TIME,

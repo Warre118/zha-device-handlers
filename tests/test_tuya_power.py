@@ -1,8 +1,11 @@
 """Tests for Tuya quirks."""
 
 import pytest
+from zha.application import Platform
+from zha.quirks import DEVICE_REGISTRY
 from zigpy.zcl import foundation
 
+from tests.zha_helpers import join_device_from_diagnostics, zha_gateway
 import zhaquirks
 import zhaquirks.tuya
 from zhaquirks.tuya import TuyaCommand, TuyaData, TuyaDatapointData
@@ -120,3 +123,20 @@ async def test_tze204_cjbofhxw_din_power_meter(zigpy_device_from_v2_quirk):
     assert cluster.get("rms_current") == 2398
     assert cluster.get("active_power") == 4108
     assert cluster.get("rms_voltage") == 2288
+
+
+async def test_tze204_cjbofhxw_from_diagnostics():
+    """Test the _TZE204_cjbofhxw entities with a joined device."""
+    async with zha_gateway() as gateway:
+        device = await join_device_from_diagnostics(
+            gateway, "tze204-cjbofhxw-ts0601-0x00000046.json", DEVICE_REGISTRY
+        )
+        sensors = {
+            type(entity).__name__: entity.native_value
+            for (platform, _), entity in device.platform_entities.items()
+            if platform == Platform.SENSOR
+        }
+
+        assert sensors["ElectricalMeasurementActivePower"] == 329.5
+        assert sensors["ElectricalMeasurementRMSCurrent"] == 1.779
+        assert sensors["ElectricalMeasurementRMSVoltage"] == 225.4

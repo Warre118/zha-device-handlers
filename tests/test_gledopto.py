@@ -3,8 +3,9 @@
 from unittest import mock
 
 import pytest
+from zha.application import Platform
 from zha.quirks import DEVICE_REGISTRY
-from zigpy.zcl import ClusterType
+from zigpy.zcl import AttributeUpdatedEvent, ClusterType
 from zigpy.zcl.clusters.general import (
     Basic,
     Groups,
@@ -15,6 +16,7 @@ from zigpy.zcl.clusters.general import (
 )
 from zigpy.zcl.clusters.lighting import Color
 
+from tests.zha_helpers import join_device_from_diagnostics, zha_gateway
 from zhaquirks.builder import UnitOfTemperature, UnitOfTime
 from zhaquirks.gledopto.glc008p import (
     COLOR_LOOP_DEFAULT_TIME,
@@ -278,3 +280,57 @@ async def test_glc008p_color_loop_time_active(glc008p):
         time=39,
         start_hue=0,
     )
+
+
+@pytest.mark.parametrize(
+    ("ep_attribute", "attribute_name", "value"),
+    [
+        ("gledopto_range_config", "warmest_k", 2700),
+        ("gledopto_range_config", "coldest_k", 6000),
+        ("gledopto_color_loop_config", "color_loop_time", 39),
+    ],
+)
+async def test_glc008p_local_settings_are_restored(
+    glc008p, ep_attribute, attribute_name, value
+):
+    """Test that local settings can be restored from the zigpy database.
+
+    zigpy stores the manufacturer code of the update event and uses it to look up
+    the attribute again on startup. A lookup that fails resets the setting.
+    """
+    cluster = getattr(glc008p.endpoints[11], ep_attribute)
+    events = []
+    cluster.on_event(AttributeUpdatedEvent.event_type, events.append)
+
+    await cluster.write_attributes({attribute_name: value})
+
+    (event,) = events
+    attr_def = cluster.find_attribute(
+        event.attribute_id, manufacturer_code=event.manufacturer_code
+    )
+    assert attr_def.name == attribute_name
+
+
+async def test_glc008p_from_diagnostics():
+    """Test the GL-C-008P entities and range mapping with a joined device."""
+    async with zha_gateway() as gateway:
+        device = await join_device_from_diagnostics(
+            gateway, "gledopto-gl-c-008p-0x19013001.json", DEVICE_REGISTRY
+        )
+        ieee = "ab:cd:ef:12:00:00:08:01"
+        light = device.get_entity(Platform.LIGHT, endpoint_id=11)
+        warmest = device.get_platform_entity(Platform.NUMBER, f"{ieee}-11-warmest_k")
+        coldest = device.get_platform_entity(Platform.NUMBER, f"{ieee}-11-coldest_k")
+        loop_time = device.get_platform_entity(
+            Platform.NUMBER, f"{ieee}-11-color_loop_time"
+        )
+
+        assert (light.min_mireds, light.max_mireds) == (154, 500)
+        assert (warmest.native_value, coldest.native_value) == (2000, 6500)
+        assert loop_time.native_value == COLOR_LOOP_DEFAULT_TIME
+
+        # ZHA reads the light limits when the entity is created, so only the
+        # cluster reflects the new range until ZHA is reloaded
+        await warmest.async_set_native_value(2700)
+        color = device.device.endpoints[11].light_color
+        assert color.get(Color.AttributeDefs.color_temp_physical_max.name) == 370
