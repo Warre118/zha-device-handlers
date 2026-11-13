@@ -205,7 +205,7 @@ class GledoptoColorLoopControlCluster(LocalDataCluster):
                     direction,
                 )
 
-                return await color_cluster.command(
+                result = await color_cluster.command(
                     Color.ServerCommandDefs.color_loop_set.id,
                     update_flags=0x05,
                     action=0x02,
@@ -215,6 +215,8 @@ class GledoptoColorLoopControlCluster(LocalDataCluster):
                     manufacturer=manufacturer,
                     expect_reply=expect_reply,
                 )
+                status = getattr(result, "status", foundation.Status.SUCCESS)
+                return _default_response(command_id, status)
 
         # A successful local setting change must still return a valid ZCL result
         # when the Color Loop is inactive (or no Color cluster is available).

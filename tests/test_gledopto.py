@@ -131,14 +131,22 @@ async def test_gledopto_glc008p_color_loop_speed_active(gledopto_glc008p):
     color._update_attribute(Color.AttributeDefs.color_loop_active.id, 1)
     color._update_attribute(Color.AttributeDefs.color_loop_direction.id, 1)
 
+    color_response = foundation.GENERAL_COMMANDS[
+        foundation.GeneralCommand.Default_Response
+    ].schema(
+        command_id=Color.ServerCommandDefs.color_loop_set.id,
+        status=foundation.Status.SUCCESS,
+    )
+
     with mock.patch.object(
         color,
         "command",
-        new=mock.AsyncMock(return_value=(None, foundation.Status.SUCCESS)),
+        new=mock.AsyncMock(return_value=color_response),
     ) as color_command:
         result = await control.command(control.ServerCommandDefs.speed_up.id)
 
-    assert result == (None, foundation.Status.SUCCESS)
+    assert result.command_id == control.ServerCommandDefs.speed_up.id
+    assert result.status == foundation.Status.SUCCESS
     color_command.assert_awaited_once_with(
         Color.ServerCommandDefs.color_loop_set.id,
         update_flags=0x05,
