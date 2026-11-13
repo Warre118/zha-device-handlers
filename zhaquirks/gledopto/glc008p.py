@@ -29,7 +29,7 @@ _LOGGER = logging.getLogger(__name__)
 
 ENDPOINT_ID: Final = 11
 
-# Native color temperature range of the controller, in mireds.
+# Fallback for the range of the controller, in mireds, until it is read.
 NATIVE_MIN_MIREDS: Final = 154
 NATIVE_MAX_MIREDS: Final = 500
 
@@ -181,8 +181,20 @@ class GledoptoColorCluster(CustomCluster, Color):
             GledoptoColorRangeConfigCluster.cluster_id
         )
         if config is None:
-            return NATIVE_MIN_MIREDS, NATIVE_MAX_MIREDS
+            return self._native_range()
         return config.mireds_range
+
+    def _native_range(self) -> tuple[int, int]:
+        """Return the range reported by the controller as (min, max) mireds."""
+        native_min = super().get(Color.AttributeDefs.color_temp_physical_min.id)
+        native_max = super().get(Color.AttributeDefs.color_temp_physical_max.id)
+        if (
+            isinstance(native_min, int)
+            and isinstance(native_max, int)
+            and 0 < native_min < native_max
+        ):
+            return native_min, native_max
+        return NATIVE_MIN_MIREDS, NATIVE_MAX_MIREDS
 
     @staticmethod
     def _map(
@@ -199,24 +211,21 @@ class GledoptoColorCluster(CustomCluster, Color):
         """Map a configured-range value to the native range."""
         if mireds in _UNMAPPED_VALUES:
             return mireds
-        return self._map(
-            mireds, self._virtual_range(), (NATIVE_MIN_MIREDS, NATIVE_MAX_MIREDS)
-        )
+        return self._map(mireds, self._virtual_range(), self._native_range())
 
     def _to_virtual(self, mireds: Any) -> Any:
         """Map a native value to the configured range."""
         if mireds in _UNMAPPED_VALUES:
             return mireds
-        return self._map(
-            mireds, (NATIVE_MIN_MIREDS, NATIVE_MAX_MIREDS), self._virtual_range()
-        )
+        return self._map(mireds, self._native_range(), self._virtual_range())
 
     def _scale_to_native(self, amount: Any) -> Any:
         """Scale a mired step size or rate to the native range."""
         if not amount:
             return amount
         virtual_min, virtual_max = self._virtual_range()
-        factor = (NATIVE_MAX_MIREDS - NATIVE_MIN_MIREDS) / (virtual_max - virtual_min)
+        native_min, native_max = self._native_range()
+        factor = (native_max - native_min) / (virtual_max - virtual_min)
         return max(1, round(amount * factor))
 
     def _translate_value(self, attr_id: int, value: Any) -> Any:
@@ -348,13 +357,38 @@ class GledoptoColorCluster(CustomCluster, Color):
             args = ()
             self._translate_command(command_id, kwargs)
 
-        return await super().command(
+        result = await super().command(
             command_id,
             *args,
             manufacturer=manufacturer,
             expect_reply=expect_reply,
             **kwargs,
         )
+
+        if (
+            command_id == Color.ServerCommandDefs.color_loop_set.id
+            and getattr(result, "status", None) == foundation.Status.SUCCESS
+        ):
+            self._update_color_loop_state(kwargs)
+        return result
+
+    def _update_color_loop_state(self, kwargs: dict[str, Any]) -> None:
+        """Track the color loop state after a successful color loop command.
+
+        ZHA only reads the color loop state on startup, so the cache is updated
+        here. The color loop time can then be applied to a running loop.
+        """
+        flags = Color.ColorLoopUpdateFlags(kwargs.get("update_flags", 0))
+        if Color.ColorLoopUpdateFlags.Action in flags:
+            self.update_attribute(
+                Color.AttributeDefs.color_loop_active.id,
+                int(kwargs.get("action") != Color.ColorLoopAction.Deactivate),
+            )
+        if Color.ColorLoopUpdateFlags.Direction in flags:
+            self.update_attribute(
+                Color.AttributeDefs.color_loop_direction.id,
+                int(kwargs.get("direction", 0)),
+            )
 
 
 (

@@ -349,13 +349,13 @@
               "id": "0x400c",
               "name": "color_temp_physical_max",
               "zcl_type": "uint16",
-              "value": 500
+              "value": 495
             },
             {
               "id": "0x400b",
               "name": "color_temp_physical_min",
               "zcl_type": "uint16",
-              "value": 154
+              "value": 158
             },
             {
               "id": "0x0007",

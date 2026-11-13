@@ -5,7 +5,7 @@ from unittest import mock
 import pytest
 from zha.application import Platform
 from zha.quirks import DEVICE_REGISTRY
-from zigpy.zcl import AttributeUpdatedEvent, ClusterType
+from zigpy.zcl import AttributeUpdatedEvent, ClusterType, foundation
 from zigpy.zcl.clusters.general import (
     Basic,
     Groups,
@@ -334,3 +334,71 @@ async def test_glc008p_from_diagnostics():
         await warmest.async_set_native_value(2700)
         color = device.device.endpoints[11].light_color
         assert color.get(Color.AttributeDefs.color_temp_physical_max.name) == 370
+
+
+def _success(command_id):
+    return foundation.GENERAL_COMMANDS[
+        foundation.GeneralCommand.Default_Response
+    ].schema(command_id=command_id, status=foundation.Status.SUCCESS)
+
+
+async def test_glc008p_color_loop_time_after_start(glc008p):
+    """Test that a loop started through ZHA picks up a new loop time."""
+    endpoint = glc008p.endpoints[11]
+    color = endpoint.light_color
+    config = endpoint.gledopto_color_loop_config
+    response = _success(Color.ServerCommandDefs.color_loop_set.id)
+
+    with mock.patch.object(
+        Color, "command", new=mock.AsyncMock(return_value=response)
+    ) as command:
+        await color.color_loop_set(
+            update_flags=Color.ColorLoopUpdateFlags.Action
+            | Color.ColorLoopUpdateFlags.Direction
+            | Color.ColorLoopUpdateFlags.Time,
+            action=Color.ColorLoopAction.Activate_from_current_hue,
+            direction=Color.ColorLoopDirection.Increment,
+            time=7,
+            start_hue=0,
+        )
+        assert color.get(Color.AttributeDefs.color_loop_active.name) == 1
+
+        await config.write_attributes({config.AttributeDefs.color_loop_time.name: 32})
+        assert command.await_count == 2
+        assert command.await_args.kwargs["time"] == 32
+        assert command.await_args.kwargs["direction"] == (
+            Color.ColorLoopDirection.Increment
+        )
+
+        await color.color_loop_set(
+            update_flags=Color.ColorLoopUpdateFlags.Action,
+            action=Color.ColorLoopAction.Deactivate,
+            direction=Color.ColorLoopDirection.Decrement,
+            time=0,
+            start_hue=0,
+        )
+        assert color.get(Color.AttributeDefs.color_loop_active.name) == 0
+
+        await config.write_attributes({config.AttributeDefs.color_loop_time.name: 39})
+        assert command.await_count == 3
+
+
+async def test_glc008p_uses_reported_native_range(glc008p):
+    """Test that the range reported by the controller is used for mapping."""
+    color = glc008p.endpoints[11].light_color
+    color.update_attribute(Color.AttributeDefs.color_temp_physical_min.id, 158)
+    color.update_attribute(Color.AttributeDefs.color_temp_physical_max.id, 495)
+
+    # The light still shows the configured range (2000-6500 K)
+    assert color.get(Color.AttributeDefs.color_temp_physical_min.name) == 154
+    assert color.get(Color.AttributeDefs.color_temp_physical_max.name) == 500
+
+    color.update_attribute(Color.AttributeDefs.color_temperature.id, 495)
+    assert color.get(Color.AttributeDefs.color_temperature.name) == 500
+
+    with mock.patch.object(Color, "command", new=mock.AsyncMock()) as command:
+        await color.move_to_color_temp(500, 0)
+        await color.move_to_color_temp(154, 0)
+
+    assert command.await_args_list[0].kwargs["color_temp_mireds"] == 495
+    assert command.await_args_list[1].kwargs["color_temp_mireds"] == 158
