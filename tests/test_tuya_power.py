@@ -88,3 +88,35 @@ async def test_ts0601_power_converter(zigpy_device_from_v2_quirk, msg, expected_
     assert status == foundation.Status.SUCCESS
 
     assert tuya_manufacturer.get("power") == expected_power
+
+async def test_tze204_cjbofhxw_din_power_meter(zigpy_device_from_v2_quirk):
+    """Test datapoint mapping and electrical measurement scaling."""
+
+    from zhaquirks.tuya import TuyaCommand, TuyaData, TuyaDatapointData
+
+    quirked = zigpy_device_from_v2_quirk("_TZE204_cjbofhxw", "TS0601")
+    ep = quirked.endpoints[1]
+    cluster = ep.electrical_measurement
+
+    assert cluster.get("ac_voltage_multiplier") == 1
+    assert cluster.get("ac_voltage_divisor") == 10
+    assert cluster.get("ac_current_multiplier") == 1
+    assert cluster.get("ac_current_divisor") == 1000
+    assert cluster.get("ac_power_multiplier") == 1
+    assert cluster.get("ac_power_divisor") == 10
+
+    command = TuyaCommand(
+        status=0,
+        tsn=1,
+        datapoints=[
+            TuyaDatapointData(18, TuyaData("2398")),
+            TuyaDatapointData(19, TuyaData("4108")),
+            TuyaDatapointData(20, TuyaData("2288")),
+        ],
+    )
+    ep.tuya_manufacturer.handle_get_data(command)
+
+    assert cluster.get("rms_current") == 2398
+    assert cluster.get("active_power") == 4108
+    assert cluster.get("rms_voltage") == 2288
+
