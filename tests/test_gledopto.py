@@ -6,7 +6,6 @@ import pytest
 from zigpy.zcl import ClusterType, foundation
 from zigpy.zcl.clusters.lighting import Color
 
-import zhaquirks.gledopto.glc008p
 import zhaquirks.gledopto.glc009
 from zhaquirks.gledopto.glc008p import (
     COLOR_LOOP_DEFAULT_SECONDS,
