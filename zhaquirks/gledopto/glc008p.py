@@ -5,12 +5,12 @@ from __future__ import annotations
 import logging
 
 import zigpy.types as t
+from zigpy.zcl import foundation
 from zigpy.typing import UNDEFINED
 from zigpy.zcl.clusters.lighting import Color
 from zigpy.zcl.foundation import (
     BaseAttributeDefs,
     BaseCommandDefs,
-    Status,
     ZCLAttributeDef,
     ZCLCommandDef,
 )
@@ -55,6 +55,13 @@ _WRITABLE_COLOR_TEMP_ATTR_IDS = frozenset(
 )
 
 _MISSING = object()
+
+
+def _default_response(command_id, status):
+    """Build the local ZCL default response for a handled command."""
+    return foundation.GENERAL_COMMANDS[
+        foundation.GeneralCommand.Default_Response
+    ].schema(command_id=command_id, status=status)
 
 
 def _coerce_kelvin(value: object, default: int) -> int:
@@ -169,10 +176,10 @@ class GledoptoColorLoopControlCluster(LocalDataCluster):
         elif command_id == self.ServerCommandDefs.speed_down.id:
             new_speed = current - COLOR_LOOP_STEP_SECONDS
         else:
-            return None, Status.UNSUP_CLUSTER_COMMAND
+            return _default_response(command_id, foundation.Status.UNSUP_CLUSTER_COMMAND)
 
         if not COLOR_LOOP_MIN_SECONDS <= new_speed <= COLOR_LOOP_MAX_SECONDS:
-            return None, Status.SUCCESS
+            return _default_response(command_id, foundation.Status.SUCCESS)
 
         self._update_attribute(
             self.AttributeDefs.color_loop_speed.id,
@@ -211,7 +218,7 @@ class GledoptoColorLoopControlCluster(LocalDataCluster):
 
         # A successful local setting change must still return a valid ZCL result
         # when the Color Loop is inactive (or no Color cluster is available).
-        return None, Status.SUCCESS
+        return _default_response(command_id, foundation.Status.SUCCESS)
 
 
 # -------------------------------------------------------------------
@@ -386,6 +393,8 @@ class GledoptoColorRangeCluster(CustomCluster, Color):
                 "direction",
                 "time",
                 "start_hue",
+                "options_mask",
+                "options_override",
             )
 
             command_values = dict(zip(names, args))

@@ -113,11 +113,13 @@ async def test_gledopto_glc008p_color_loop_speed_inactive(gledopto_glc008p):
     control = gledopto_glc008p.endpoints[11].gledopto_color_loop_control
 
     result = await control.command(control.ServerCommandDefs.speed_up.id)
-    assert result == (None, foundation.Status.SUCCESS)
+    assert result.command_id == control.ServerCommandDefs.speed_up.id
+    assert result.status == foundation.Status.SUCCESS
     assert control.get("color_loop_speed") == 32
 
     result = await control.command(control.ServerCommandDefs.speed_down.id)
-    assert result == (None, foundation.Status.SUCCESS)
+    assert result.command_id == control.ServerCommandDefs.speed_down.id
+    assert result.status == foundation.Status.SUCCESS
     assert control.get("color_loop_speed") == 25
 
 
