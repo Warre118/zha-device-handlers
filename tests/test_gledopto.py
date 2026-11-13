@@ -4,6 +4,7 @@ from unittest import mock
 
 import pytest
 from zha.application import Platform
+from zha.const import STATE_CHANGED
 from zha.quirks import DEVICE_REGISTRY
 from zigpy.zcl import AttributeUpdatedEvent, ClusterType, foundation
 from zigpy.zcl.clusters.general import (
@@ -23,6 +24,7 @@ from zhaquirks.gledopto.glc008p import (
     GledoptoColorCluster,
     GledoptoColorLoopConfigCluster,
     GledoptoColorRangeConfigCluster,
+    GledoptoLight,
 )
 import zhaquirks.gledopto.glc009
 
@@ -329,11 +331,18 @@ async def test_glc008p_from_diagnostics():
         assert (warmest.native_value, coldest.native_value) == (2000, 6500)
         assert loop_time.native_value == COLOR_LOOP_DEFAULT_TIME
 
-        # ZHA reads the light limits when the entity is created, so only the
-        # cluster reflects the new range until ZHA is reloaded
+        assert isinstance(light, GledoptoLight)
+        states = []
+        light.on_event(STATE_CHANGED, states.append)
+
+        # The light follows a new range without reloading ZHA
         await warmest.async_set_native_value(2700)
-        color = device.device.endpoints[11].light_color
-        assert color.get(Color.AttributeDefs.color_temp_physical_max.name) == 370
+        assert (light.min_mireds, light.max_mireds) == (154, 370)
+        assert states[-1].state_diff["max_mireds"] == 370
+
+        await coldest.async_set_native_value(6000)
+        assert (light.min_mireds, light.max_mireds) == (167, 370)
+        assert states[-1].state_diff["min_mireds"] == 167
 
 
 def _success(command_id):

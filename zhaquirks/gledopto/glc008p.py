@@ -15,9 +15,11 @@ from __future__ import annotations
 import logging
 from typing import Any, Final
 
+from zha.application.platforms.light import Light
 import zigpy.types as t
 from zigpy.typing import UNDEFINED, UndefinedType
-from zigpy.zcl import foundation
+from zigpy.zcl import AttributeUpdatedEvent, foundation
+from zigpy.zcl.clusters.general import OnOff
 from zigpy.zcl.clusters.lighting import Color
 from zigpy.zcl.foundation import BaseAttributeDefs, ZCLAttributeDef
 
@@ -391,11 +393,55 @@ class GledoptoColorCluster(CustomCluster, Color):
             )
 
 
+class GledoptoLight(Light):
+    """Light that follows the configured color temperature range live.
+
+    ZHA reads the color temperature limits once, when the entity is created.
+    This light reads them on every state update and sends a state update when
+    the configured range changes.
+    """
+
+    @property
+    def min_mireds(self) -> int:
+        """Return the coldest configured color temperature."""
+        return self._color_min_mireds
+
+    @property
+    def max_mireds(self) -> int:
+        """Return the warmest configured color temperature."""
+        return self._color_max_mireds
+
+    def on_add(self) -> None:
+        """Listen for changes of the configured range."""
+        super().on_add()
+        config = self.endpoint.zigpy_endpoint.in_clusters.get(
+            GledoptoColorRangeConfigCluster.cluster_id
+        )
+        if config is not None:
+            self._on_remove_callbacks.append(
+                config.on_event(
+                    AttributeUpdatedEvent.event_type, self._handle_range_updated
+                )
+            )
+
+    def _handle_range_updated(self, event: AttributeUpdatedEvent) -> None:
+        """Update the limits and current color temperature in Home Assistant."""
+        if self.color_temp is not None:
+            self._color_temp = self._color_temperature
+        self.maybe_emit_state_changed_event()
+
+
 (
     QuirkBuilder("GLEDOPTO", "GL-C-008P")
     .replaces(GledoptoColorCluster, endpoint_id=ENDPOINT_ID)
     .adds(GledoptoColorRangeConfigCluster, endpoint_id=ENDPOINT_ID)
     .adds(GledoptoColorLoopConfigCluster, endpoint_id=ENDPOINT_ID)
+    .replaces_entity(
+        Light,
+        GledoptoLight,
+        endpoint_id=ENDPOINT_ID,
+        cluster_id=OnOff.cluster_id,
+    )
     .number(
         attribute_name=GledoptoColorRangeConfigCluster.AttributeDefs.warmest_k.name,
         cluster_id=GledoptoColorRangeConfigCluster.cluster_id,
