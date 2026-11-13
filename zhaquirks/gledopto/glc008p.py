@@ -102,6 +102,8 @@ class GledoptoRangeConfigCluster(LocalDataCluster):
     }
 
     class AttributeDefs(BaseAttributeDefs):
+        """Attributes for virtual Kelvin range configuration."""
+
         warmest_k = ZCLAttributeDef(
             id=0x0000,
             type=t.uint16_t,
@@ -135,6 +137,8 @@ class GledoptoColorLoopControlCluster(LocalDataCluster):
     }
 
     class AttributeDefs(BaseAttributeDefs):
+        """Attributes for local Color Loop controls."""
+
         color_loop_speed = ZCLAttributeDef(
             id=0x0000,
             type=t.uint16_t,
@@ -142,6 +146,8 @@ class GledoptoColorLoopControlCluster(LocalDataCluster):
         )
 
     class ServerCommandDefs(BaseCommandDefs):
+        """Commands for adjusting Color Loop speed."""
+
         speed_up = ZCLCommandDef(id=0x00, schema={})
         speed_down = ZCLCommandDef(id=0x01, schema={})
 

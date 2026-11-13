@@ -1,3 +1,5 @@
+"""Tests for GLEDOPTO quirks."""
+
 from unittest import mock
 
 import pytest
@@ -145,4 +147,38 @@ async def test_gledopto_glc008p_color_loop_speed_active(gledopto_glc008p):
         start_hue=0,
         manufacturer=None,
         expect_reply=True,
+    )
+
+
+async def test_gledopto_glc008p_start_uses_saved_color_loop_speed(gledopto_glc008p):
+    """Starting the Color Loop overrides the command time with the saved speed."""
+    endpoint = gledopto_glc008p.endpoints[11]
+    control = endpoint.gledopto_color_loop_control
+    color = endpoint.color
+    control._update_attribute(control.AttributeDefs.color_loop_speed.id, 39)
+
+    with mock.patch.object(
+        Color,
+        "command",
+        new=mock.AsyncMock(return_value=(None, foundation.Status.SUCCESS)),
+    ) as parent_command:
+        result = await color.command(
+            Color.ServerCommandDefs.color_loop_set.id,
+            update_flags=0x01,
+            action=0x02,
+            direction=0,
+            time=25,
+            start_hue=0,
+        )
+
+    assert result == (None, foundation.Status.SUCCESS)
+    parent_command.assert_awaited_once_with(
+        Color.ServerCommandDefs.color_loop_set.id,
+        manufacturer=None,
+        expect_reply=True,
+        update_flags=0x05,
+        action=0x02,
+        direction=0,
+        time=39,
+        start_hue=0,
     )
