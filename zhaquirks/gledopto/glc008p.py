@@ -1,488 +1,341 @@
-"""Custom ZHA quirk for GLEDOPTO GL-C-008P RGB+CCT."""
+"""GLEDOPTO GL-C-008P RGB+CCT LED controller.
+
+The controller reports a fixed color temperature range, but the white channels
+of the connected LED strip determine the real range. This quirk lets the user
+enter the warmest and coldest temperature of the strip. Home Assistant then
+works with that range, while commands and attribute values are mapped linearly
+onto the native range of the controller.
+
+The quirk also adds a configurable color loop time, which is used when the
+color loop effect is started and is applied to a running color loop.
+"""
 
 from __future__ import annotations
 
 import logging
+from typing import Any, Final
 
 import zigpy.types as t
+from zigpy.typing import UNDEFINED, UndefinedType
 from zigpy.zcl import foundation
-from zigpy.typing import UNDEFINED
 from zigpy.zcl.clusters.lighting import Color
-from zigpy.zcl.foundation import (
-    BaseAttributeDefs,
-    BaseCommandDefs,
-    ZCLAttributeDef,
-    ZCLCommandDef,
-)
+from zigpy.zcl.foundation import BaseAttributeDefs, ZCLAttributeDef
 
 from zhaquirks import LocalDataCluster
-from zhaquirks.builder import QuirkBuilder, UnitOfTime
+from zhaquirks.builder import QuirkBuilder, UnitOfTemperature, UnitOfTime
 from zhaquirks.clusters import CustomCluster
-
 
 _LOGGER = logging.getLogger(__name__)
 
-MANUFACTURER = "GLEDOPTO"
-MODEL = "GL-C-008P"
-ENDPOINT_ID = 11
+ENDPOINT_ID: Final = 11
 
-# Native limits reported by the device.
-NATIVE_MIN_MIREDS = 154
-NATIVE_MAX_MIREDS = 500
+# Native color temperature range of the controller, in mireds.
+NATIVE_MIN_MIREDS: Final = 154
+NATIVE_MAX_MIREDS: Final = 500
 
-DEFAULT_WARMEST_K = 2000
-DEFAULT_COLDEST_K = 6500
+# The defaults match the native range, so the mapping is transparent until the
+# user configures the range of the connected strip.
+DEFAULT_WARMEST_K: Final = 2000
+DEFAULT_COLDEST_K: Final = 6500
+KELVIN_MIN: Final = 1000
+KELVIN_MAX: Final = 10000
+KELVIN_STEP: Final = 50
 
-KELVIN_MIN = 1000
-KELVIN_MAX = 10000
+# Color loop time in seconds per full loop. The steps follow the values the
+# controller uses itself.
+COLOR_LOOP_DEFAULT_TIME: Final = 25
+COLOR_LOOP_MIN_TIME: Final = 4
+COLOR_LOOP_MAX_TIME: Final = 60
+COLOR_LOOP_TIME_STEP: Final = 7
 
-COLOR_LOOP_DEFAULT_SECONDS = 25
-COLOR_LOOP_STEP_SECONDS = 7
-COLOR_LOOP_MIN_SECONDS = 4
-COLOR_LOOP_MAX_SECONDS = 60
+# Special values that are not color temperatures and must not be mapped.
+START_UP_COLOR_TEMP_PREVIOUS: Final = 0xFFFF
+_UNMAPPED_VALUES: Final = (None, 0, START_UP_COLOR_TEMP_PREVIOUS)
 
-_COLOR_TEMP_ATTR_IDS = frozenset(
+_COLOR_TEMP_ATTR_IDS: Final = frozenset(
     {
         Color.AttributeDefs.color_temperature.id,
         Color.AttributeDefs.start_up_color_temperature.id,
     }
 )
 
-_WRITABLE_COLOR_TEMP_ATTR_IDS = frozenset(
+_RANGE_ATTR_IDS: Final = frozenset(
     {
-        Color.AttributeDefs.start_up_color_temperature.id,
+        Color.AttributeDefs.color_temp_physical_min.id,
+        Color.AttributeDefs.color_temp_physical_max.id,
     }
 )
 
 _MISSING = object()
 
 
-def _default_response(command_id, status):
-    """Build the local ZCL default response for a handled command."""
-    return foundation.GENERAL_COMMANDS[
-        foundation.GeneralCommand.Default_Response
-    ].schema(command_id=command_id, status=status)
-
-
-def _coerce_kelvin(value: object, default: int) -> int:
+def _kelvin_range_to_mireds(warmest_k: Any, coldest_k: Any) -> tuple[int, int]:
+    """Convert a Kelvin range to a (min, max) mired range."""
     try:
-        kelvin = int(round(float(value)))
-    except (TypeError, ValueError, OverflowError):
-        return default
+        warmest = min(max(int(warmest_k), KELVIN_MIN), KELVIN_MAX)
+        coldest = min(max(int(coldest_k), KELVIN_MIN), KELVIN_MAX)
+    except (TypeError, ValueError):
+        return NATIVE_MIN_MIREDS, NATIVE_MAX_MIREDS
 
-    return max(KELVIN_MIN, min(KELVIN_MAX, kelvin))
-
-
-def _kelvin_range_to_mireds(
-    warmest_k: object,
-    coldest_k: object,
-) -> tuple[int, int]:
-    warmest = _coerce_kelvin(warmest_k, DEFAULT_WARMEST_K)
-    coldest = _coerce_kelvin(coldest_k, DEFAULT_COLDEST_K)
-
-    min_mireds = round(1_000_000 / coldest)
-    max_mireds = round(1_000_000 / warmest)
-
-    if min_mireds > max_mireds:
-        min_mireds, max_mireds = max_mireds, min_mireds
-
+    min_mireds, max_mireds = sorted(
+        (round(1_000_000 / coldest), round(1_000_000 / warmest))
+    )
     if min_mireds == max_mireds:
         return NATIVE_MIN_MIREDS, NATIVE_MAX_MIREDS
 
     return min_mireds, max_mireds
 
 
-# -------------------------------------------------------------------
-# Local CCT configuration
-# -------------------------------------------------------------------
+class GledoptoColorRangeConfigCluster(LocalDataCluster):
+    """Local cluster holding the color temperature range of the LED strip."""
 
-
-class GledoptoRangeConfigCluster(LocalDataCluster):
-    """Local per-device CCT range settings."""
-
-    cluster_id = 0xFC01
-    ep_attribute = "gledopto_range_config"
-
-    _DEFAULT_VALUES = {
-        0x0000: DEFAULT_WARMEST_K,
-        0x0001: DEFAULT_COLDEST_K,
-    }
+    cluster_id: t.uint16_t = 0xFC01
+    name: str = "GLEDOPTO Color Range Config"
+    ep_attribute: str = "gledopto_range_config"
 
     class AttributeDefs(BaseAttributeDefs):
-        """Attributes for virtual Kelvin range configuration."""
+        """Attribute definitions."""
 
-        warmest_k = ZCLAttributeDef(
-            id=0x0000,
-            type=t.uint16_t,
-        )
-        coldest_k = ZCLAttributeDef(
-            id=0x0001,
-            type=t.uint16_t,
-        )
+        warmest_k: Final = ZCLAttributeDef(id=0x0000, type=t.uint16_t)
+        coldest_k: Final = ZCLAttributeDef(id=0x0001, type=t.uint16_t)
+
+    _DEFAULT_VALUES = {
+        AttributeDefs.warmest_k.id: DEFAULT_WARMEST_K,
+        AttributeDefs.coldest_k.id: DEFAULT_COLDEST_K,
+    }
 
     @property
     def mireds_range(self) -> tuple[int, int]:
-        warmest = self.get(self.AttributeDefs.warmest_k) or DEFAULT_WARMEST_K
-        coldest = self.get(self.AttributeDefs.coldest_k) or DEFAULT_COLDEST_K
-
-        return _kelvin_range_to_mireds(warmest, coldest)
-
-
-# -------------------------------------------------------------------
-# Local Color Loop controls
-# -------------------------------------------------------------------
+        """Return the configured range as (min, max) mireds."""
+        return _kelvin_range_to_mireds(
+            self.get(self.AttributeDefs.warmest_k.id),
+            self.get(self.AttributeDefs.coldest_k.id),
+        )
 
 
-class GledoptoColorLoopControlCluster(LocalDataCluster):
-    """Local Color Loop speed setting and controls."""
+class GledoptoColorLoopConfigCluster(LocalDataCluster):
+    """Local cluster holding the color loop time."""
 
-    cluster_id = 0xFC02
-    ep_attribute = "gledopto_color_loop_control"
-
-    _DEFAULT_VALUES = {
-        0x0000: COLOR_LOOP_DEFAULT_SECONDS,
-    }
+    cluster_id: t.uint16_t = 0xFC02
+    name: str = "GLEDOPTO Color Loop Config"
+    ep_attribute: str = "gledopto_color_loop_config"
 
     class AttributeDefs(BaseAttributeDefs):
-        """Attributes for local Color Loop controls."""
+        """Attribute definitions."""
 
-        color_loop_speed = ZCLAttributeDef(
-            id=0x0000,
-            type=t.uint16_t,
-            access="r",
-        )
+        color_loop_time: Final = ZCLAttributeDef(id=0x0000, type=t.uint16_t)
 
-    class ServerCommandDefs(BaseCommandDefs):
-        """Commands for adjusting Color Loop speed."""
-
-        speed_up = ZCLCommandDef(id=0x00, schema={})
-        speed_down = ZCLCommandDef(id=0x01, schema={})
-
-    async def command(
-        self,
-        command_id,
-        *args,
-        manufacturer=None,
-        expect_reply=True,
-        **kwargs,
-    ):
-        current = int(
-            self.get(self.AttributeDefs.color_loop_speed)
-            or COLOR_LOOP_DEFAULT_SECONDS
-        )
-
-        if command_id == self.ServerCommandDefs.speed_up.id:
-            new_speed = current + COLOR_LOOP_STEP_SECONDS
-        elif command_id == self.ServerCommandDefs.speed_down.id:
-            new_speed = current - COLOR_LOOP_STEP_SECONDS
-        else:
-            return _default_response(command_id, foundation.Status.UNSUP_CLUSTER_COMMAND)
-
-        if not COLOR_LOOP_MIN_SECONDS <= new_speed <= COLOR_LOOP_MAX_SECONDS:
-            return _default_response(command_id, foundation.Status.SUCCESS)
-
-        self._update_attribute(
-            self.AttributeDefs.color_loop_speed.id,
-            new_speed,
-        )
-
-        _LOGGER.info("Color Loop speed changed to %s seconds", new_speed)
-
-        color_cluster = self.endpoint.in_clusters.get(Color.cluster_id)
-
-        if color_cluster is not None:
-            active = color_cluster.get(Color.AttributeDefs.color_loop_active)
-
-            if active is not None and int(active) != 0:
-                direction = color_cluster.get(
-                    Color.AttributeDefs.color_loop_direction
-                )
-                direction = int(direction or 0)
-
-                _LOGGER.info(
-                    "Updating active Color Loop: speed=%s seconds, direction=%s",
-                    new_speed,
-                    direction,
-                )
-
-                result = await color_cluster.command(
-                    Color.ServerCommandDefs.color_loop_set.id,
-                    update_flags=0x05,
-                    action=0x02,
-                    direction=direction,
-                    time=new_speed,
-                    start_hue=0,
-                    manufacturer=manufacturer,
-                    expect_reply=expect_reply,
-                )
-                status = getattr(result, "status", foundation.Status.SUCCESS)
-                return _default_response(command_id, status)
-
-        # A successful local setting change must still return a valid ZCL result
-        # when the Color Loop is inactive (or no Color cluster is available).
-        return _default_response(command_id, foundation.Status.SUCCESS)
-
-
-# -------------------------------------------------------------------
-# Color Control cluster
-# -------------------------------------------------------------------
-
-
-class GledoptoColorRangeCluster(CustomCluster, Color):
-    """Map the configurable virtual CCT range to native mireds."""
-
-    def _virtual_range(self) -> tuple[int, int]:
-        config_cluster = self.endpoint.in_clusters.get(
-            GledoptoRangeConfigCluster.cluster_id
-        )
-
-        if config_cluster is not None:
-            return config_cluster.mireds_range
-
-        return _kelvin_range_to_mireds(
-            DEFAULT_WARMEST_K,
-            DEFAULT_COLDEST_K,
-        )
-
-    @staticmethod
-    def _virtual_to_native(mireds, virtual_min, virtual_max):
-        if mireds is None:
-            return None
-
-        span = virtual_max - virtual_min
-        ratio = (
-            0.0
-            if span == 0
-            else (float(mireds) - virtual_min) / span
-        )
-        ratio = max(0.0, min(1.0, ratio))
-
-        return round(
-            NATIVE_MIN_MIREDS
-            + ratio * (NATIVE_MAX_MIREDS - NATIVE_MIN_MIREDS)
-        )
-
-    @staticmethod
-    def _native_to_virtual(mireds, virtual_min, virtual_max):
-        if mireds is None:
-            return None
-
-        native_span = NATIVE_MAX_MIREDS - NATIVE_MIN_MIREDS
-        ratio = (float(mireds) - NATIVE_MIN_MIREDS) / native_span
-        ratio = max(0.0, min(1.0, ratio))
-
-        return round(
-            virtual_min + ratio * (virtual_max - virtual_min)
-        )
-
-    def get(self, key, default=None):
-        """Return virtual CCT values."""
-
-        try:
-            attr = self.find_attribute(key)
-        except (KeyError, ValueError):
-            return super().get(key, default)
-
-        if attr.id == Color.AttributeDefs.color_temp_physical_min.id:
-            return self._virtual_range()[0]
-
-        if attr.id == Color.AttributeDefs.color_temp_physical_max.id:
-            return self._virtual_range()[1]
-
-        value = super().get(key, _MISSING)
-
-        if value is _MISSING:
-            return default
-
-        if value in (None, 0) or attr.id not in _COLOR_TEMP_ATTR_IDS:
-            return value
-
-        return self._native_to_virtual(
-            value,
-            *self._virtual_range(),
-        )
-
-    async def read_attributes(
-        self,
-        attributes,
-        allow_cache=False,
-        only_cache=False,
-        manufacturer=UNDEFINED,
-        **kwargs,
-    ):
-        """Return virtual CCT values in attribute reads."""
-
-        success, failure = await super().read_attributes(
-            attributes,
-            allow_cache=allow_cache,
-            only_cache=only_cache,
-            manufacturer=manufacturer,
-            **kwargs,
-        )
-
-        for attr_id in list(success):
-            try:
-                attr = self.find_attribute(attr_id)
-            except (KeyError, ValueError):
-                continue
-
-            value = success[attr_id]
-
-            if attr.id == Color.AttributeDefs.color_temp_physical_min.id:
-                success[attr_id] = self._virtual_range()[0]
-
-            elif attr.id == Color.AttributeDefs.color_temp_physical_max.id:
-                success[attr_id] = self._virtual_range()[1]
-
-            elif value not in (None, 0) and attr.id in _COLOR_TEMP_ATTR_IDS:
-                success[attr_id] = self._native_to_virtual(
-                    value,
-                    *self._virtual_range(),
-                )
-
-        return success, failure
+    _DEFAULT_VALUES = {
+        AttributeDefs.color_loop_time.id: COLOR_LOOP_DEFAULT_TIME,
+    }
 
     async def write_attributes(
         self,
-        attributes,
-        manufacturer=UNDEFINED,
-        *,
-        update_cache=True,
+        attributes: dict[str | int | foundation.ZCLAttributeDef, Any],
+        manufacturer: int | UndefinedType | None = UNDEFINED,
         **kwargs,
-    ):
-        """Translate startup CCT writes to native mireds."""
+    ) -> list[list[foundation.WriteAttributesStatusRecord]]:
+        """Store the color loop time and apply it to a running color loop."""
+        result = await super().write_attributes(attributes, manufacturer, **kwargs)
 
-        converted = dict(attributes)
+        color = self.endpoint.in_clusters.get(Color.cluster_id)
+        if color is None or not color.get(Color.AttributeDefs.color_loop_active.id):
+            return result
 
-        for attr_id, value in attributes.items():
-            if value in (None, 0):
-                continue
+        loop_time = self.get(self.AttributeDefs.color_loop_time.id)
+        _LOGGER.debug("Applying color loop time %s s to running loop", loop_time)
 
-            try:
-                attr = self.find_attribute(attr_id)
-            except (KeyError, ValueError):
-                continue
-
-            if attr.id in _WRITABLE_COLOR_TEMP_ATTR_IDS:
-                converted[attr_id] = self._virtual_to_native(
-                    value,
-                    *self._virtual_range(),
-                )
-
-        return await super().write_attributes(
-            converted,
-            manufacturer=manufacturer,
-            update_cache=update_cache,
-            **kwargs,
+        # The controller ignores a time-only update, so the loop is activated
+        # again with the new time.
+        await color.color_loop_set(
+            update_flags=(
+                Color.ColorLoopUpdateFlags.Action | Color.ColorLoopUpdateFlags.Time
+            ),
+            action=Color.ColorLoopAction.Activate_from_current_hue,
+            direction=Color.ColorLoopDirection(
+                color.get(Color.AttributeDefs.color_loop_direction.id) or 0
+            ),
+            time=loop_time,
+            start_hue=0,
         )
+        return result
+
+
+class GledoptoColorCluster(CustomCluster, Color):
+    """Color cluster that maps the configured range onto the native range."""
+
+    def _virtual_range(self) -> tuple[int, int]:
+        """Return the configured range as (min, max) mireds."""
+        config = self.endpoint.in_clusters.get(
+            GledoptoColorRangeConfigCluster.cluster_id
+        )
+        if config is None:
+            return NATIVE_MIN_MIREDS, NATIVE_MAX_MIREDS
+        return config.mireds_range
+
+    @staticmethod
+    def _map(
+        value: float,
+        from_range: tuple[int, int],
+        to_range: tuple[int, int],
+    ) -> int:
+        """Map a mired value linearly from one range onto another."""
+        ratio = (float(value) - from_range[0]) / (from_range[1] - from_range[0])
+        ratio = min(max(ratio, 0.0), 1.0)
+        return round(to_range[0] + ratio * (to_range[1] - to_range[0]))
+
+    def _to_native(self, mireds: Any) -> Any:
+        """Map a configured-range value to the native range."""
+        if mireds in _UNMAPPED_VALUES:
+            return mireds
+        return self._map(
+            mireds, self._virtual_range(), (NATIVE_MIN_MIREDS, NATIVE_MAX_MIREDS)
+        )
+
+    def _to_virtual(self, mireds: Any) -> Any:
+        """Map a native value to the configured range."""
+        if mireds in _UNMAPPED_VALUES:
+            return mireds
+        return self._map(
+            mireds, (NATIVE_MIN_MIREDS, NATIVE_MAX_MIREDS), self._virtual_range()
+        )
+
+    def _scale_to_native(self, amount: Any) -> Any:
+        """Scale a mired step size or rate to the native range."""
+        if not amount:
+            return amount
+        virtual_min, virtual_max = self._virtual_range()
+        factor = (NATIVE_MAX_MIREDS - NATIVE_MIN_MIREDS) / (virtual_max - virtual_min)
+        return max(1, round(amount * factor))
+
+    def _translate_value(self, attr_id: int, value: Any) -> Any:
+        """Return the value Home Assistant should see for an attribute."""
+        if attr_id == Color.AttributeDefs.color_temp_physical_min.id:
+            return self._virtual_range()[0]
+        if attr_id == Color.AttributeDefs.color_temp_physical_max.id:
+            return self._virtual_range()[1]
+        if attr_id in _COLOR_TEMP_ATTR_IDS:
+            return self._to_virtual(value)
+        return value
+
+    def get(self, key: int | str, default: Any | None = None) -> Any:
+        """Return cached values in the configured range."""
+        try:
+            attr_def = self.find_attribute(key)
+        except KeyError:
+            return super().get(key, default)
+
+        if attr_def.id in _RANGE_ATTR_IDS:
+            return self._translate_value(attr_def.id, None)
+
+        value = super().get(key, _MISSING)
+        if value is _MISSING:
+            return default
+        return self._translate_value(attr_def.id, value)
+
+    async def read_attributes(
+        self,
+        attributes: list[int | str | foundation.ZCLAttributeDef],
+        allow_cache: bool = False,
+        only_cache: bool = False,
+        manufacturer: int | UndefinedType | None = UNDEFINED,
+        **kwargs,
+    ) -> Any:
+        """Return read values in the configured range.
+
+        The physical limits are answered locally, as they only depend on the
+        configured range.
+        """
+        local = {
+            key: self._translate_value(attr_id, None)
+            for key in attributes
+            if (attr_id := self.find_attribute(key).id) in _RANGE_ATTR_IDS
+        }
+        remote = [key for key in attributes if key not in local]
+
+        success, failure = {}, {}
+        if remote:
+            success, failure = await super().read_attributes(
+                remote,
+                allow_cache=allow_cache,
+                only_cache=only_cache,
+                manufacturer=manufacturer,
+                **kwargs,
+            )
+        for key, value in success.items():
+            success[key] = self._translate_value(self.find_attribute(key).id, value)
+        return {**success, **local}, failure
+
+    async def write_attributes(
+        self,
+        attributes: dict[str | int | foundation.ZCLAttributeDef, Any],
+        manufacturer: int | UndefinedType | None = UNDEFINED,
+        **kwargs,
+    ) -> list[list[foundation.WriteAttributesStatusRecord]]:
+        """Map the start-up color temperature to the native range."""
+        start_up_id = Color.AttributeDefs.start_up_color_temperature.id
+        attributes = {
+            key: (
+                self._to_native(value)
+                if self.find_attribute(key).id == start_up_id
+                else value
+            )
+            for key, value in attributes.items()
+        }
+        return await super().write_attributes(attributes, manufacturer, **kwargs)
+
+    def _translate_command(self, command_id: int, kwargs: dict[str, Any]) -> None:
+        """Map color temperature and color loop command arguments in place."""
+        commands = Color.ServerCommandDefs
+
+        if command_id == commands.move_to_color_temp.id:
+            kwargs["color_temp_mireds"] = self._to_native(kwargs["color_temp_mireds"])
+            return
+
+        if command_id == commands.color_loop_set.id:
+            flags = Color.ColorLoopUpdateFlags(kwargs.get("update_flags", 0))
+            if Color.ColorLoopUpdateFlags.Action in flags and kwargs.get("action") in (
+                Color.ColorLoopAction.Activate_from_color_loop_hue,
+                Color.ColorLoopAction.Activate_from_current_hue,
+            ):
+                config = self.endpoint.in_clusters.get(
+                    GledoptoColorLoopConfigCluster.cluster_id
+                )
+                if config is not None:
+                    kwargs["time"] = config.get(
+                        GledoptoColorLoopConfigCluster.AttributeDefs.color_loop_time.id
+                    )
+                    kwargs["update_flags"] = flags | Color.ColorLoopUpdateFlags.Time
+            return
+
+        # move_color_temp and step_color_temp. A limit of 0 means "use the
+        # physical limit" and is left untouched by _to_native.
+        for name in ("color_temp_min_mireds", "color_temp_max_mireds"):
+            if name in kwargs:
+                kwargs[name] = self._to_native(kwargs[name])
+        for name in ("rate", "step_size"):
+            if name in kwargs:
+                kwargs[name] = self._scale_to_native(kwargs[name])
 
     async def command(
         self,
-        command_id,
+        command_id: foundation.GeneralCommand | int | t.uint8_t,
         *args,
-        manufacturer=None,
-        expect_reply=True,
-        **kwargs,
+        manufacturer: int | t.uint16_t | None = None,
+        expect_reply: bool = True,
+        **kwargs: Any,
     ):
-        """Translate CCT commands and configure Color Loop speed."""
-
-        kwargs = dict(kwargs)
-
-        if command_id == Color.ServerCommandDefs.color_loop_set.id:
-            names = (
-                "update_flags",
-                "action",
-                "direction",
-                "time",
-                "start_hue",
-                "options_mask",
-                "options_override",
-            )
-
-            command_values = dict(zip(names, args))
-            command_values.update(kwargs)
-
-            flags = int(command_values.get("update_flags", 0))
-            action = int(command_values.get("action", -1))
-
-            action_flag = 0x01
-            time_flag = 0x04
-
-            # Configure the requested speed when starting the loop.
-            if flags & action_flag and action in (0x01, 0x02):
-                control_cluster = self.endpoint.in_clusters.get(
-                    GledoptoColorLoopControlCluster.cluster_id
-                )
-
-                if control_cluster is not None:
-                    speed = int(
-                        control_cluster.get(
-                            GledoptoColorLoopControlCluster.AttributeDefs.color_loop_speed
-                        )
-                        or COLOR_LOOP_DEFAULT_SECONDS
-                    )
-
-                    command_values["time"] = speed
-                    command_values["update_flags"] = flags | time_flag
-
-                    _LOGGER.info("Starting Color Loop with speed %s seconds", speed)
-
-            return await super().command(
-                command_id,
-                manufacturer=manufacturer,
-                expect_reply=expect_reply,
-                **command_values,
-            )
-
-        # Move to color temperature.
-        if command_id == Color.ServerCommandDefs.move_to_color_temp.id:
-            virtual_min, virtual_max = self._virtual_range()
-
-            if args:
-                args = (
-                    self._virtual_to_native(
-                        args[0],
-                        virtual_min,
-                        virtual_max,
-                    ),
-                    *args[1:],
-                )
-            elif "color_temp_mireds" in kwargs:
-                kwargs["color_temp_mireds"] = self._virtual_to_native(
-                    kwargs["color_temp_mireds"],
-                    virtual_min,
-                    virtual_max,
-                )
-
-        # Move / step color temperature.
-        elif command_id in (
+        """Map color temperature commands and apply the color loop time."""
+        if command_id in (
+            Color.ServerCommandDefs.move_to_color_temp.id,
             Color.ServerCommandDefs.move_color_temp.id,
             Color.ServerCommandDefs.step_color_temp.id,
+            Color.ServerCommandDefs.color_loop_set.id,
         ):
-            virtual_min, virtual_max = self._virtual_range()
-            args = list(args)
-
-            if command_id == Color.ServerCommandDefs.move_color_temp.id:
-                positional_indexes = (2, 3)
-            else:
-                positional_indexes = (3, 4)
-
-            for index, name in zip(
-                positional_indexes,
-                ("color_temp_min_mireds", "color_temp_max_mireds"),
-            ):
-                if len(args) > index:
-                    args[index] = self._virtual_to_native(
-                        args[index],
-                        virtual_min,
-                        virtual_max,
-                    )
-                elif name in kwargs:
-                    kwargs[name] = self._virtual_to_native(
-                        kwargs[name],
-                        virtual_min,
-                        virtual_max,
-                    )
+            schema = self.server_commands[command_id].schema
+            kwargs = {**dict(zip((f.name for f in schema.fields), args)), **kwargs}
+            args = ()
+            self._translate_command(command_id, kwargs)
 
         return await super().command(
             command_id,
@@ -493,72 +346,45 @@ class GledoptoColorRangeCluster(CustomCluster, Color):
         )
 
 
-# -------------------------------------------------------------------
-# Quirk registration and Home Assistant entities
-# -------------------------------------------------------------------
-
-builder = (
-    QuirkBuilder(MANUFACTURER, MODEL)
-    .replaces(
-        GledoptoColorRangeCluster,
-        endpoint_id=ENDPOINT_ID,
-    )
-    .adds(
-        GledoptoRangeConfigCluster,
-        endpoint_id=ENDPOINT_ID,
-    )
-    .adds(
-        GledoptoColorLoopControlCluster,
-        endpoint_id=ENDPOINT_ID,
-    )
+(
+    QuirkBuilder("GLEDOPTO", "GL-C-008P")
+    .replaces(GledoptoColorCluster, endpoint_id=ENDPOINT_ID)
+    .adds(GledoptoColorRangeConfigCluster, endpoint_id=ENDPOINT_ID)
+    .adds(GledoptoColorLoopConfigCluster, endpoint_id=ENDPOINT_ID)
     .number(
-        attribute_name="warmest_k",
-        cluster_id=GledoptoRangeConfigCluster.cluster_id,
+        attribute_name=GledoptoColorRangeConfigCluster.AttributeDefs.warmest_k.name,
+        cluster_id=GledoptoColorRangeConfigCluster.cluster_id,
         endpoint_id=ENDPOINT_ID,
         min_value=KELVIN_MIN,
         max_value=KELVIN_MAX,
-        step=50,
-        unit="K",
+        step=KELVIN_STEP,
+        unit=UnitOfTemperature.KELVIN,
         mode="box",
-        translation_key="cct_warmest_k",
-        fallback_name="CCT warmest (K)",
+        translation_key="warmest_color_temperature",
+        fallback_name="Warmest color temperature",
     )
     .number(
-        attribute_name="coldest_k",
-        cluster_id=GledoptoRangeConfigCluster.cluster_id,
+        attribute_name=GledoptoColorRangeConfigCluster.AttributeDefs.coldest_k.name,
+        cluster_id=GledoptoColorRangeConfigCluster.cluster_id,
         endpoint_id=ENDPOINT_ID,
         min_value=KELVIN_MIN,
         max_value=KELVIN_MAX,
-        step=50,
-        unit="K",
+        step=KELVIN_STEP,
+        unit=UnitOfTemperature.KELVIN,
         mode="box",
-        translation_key="cct_coldest_k",
-        fallback_name="CCT coldest (K)",
+        translation_key="coldest_color_temperature",
+        fallback_name="Coldest color temperature",
     )
-    .sensor(
-        attribute_name="color_loop_speed",
-        cluster_id=GledoptoColorLoopControlCluster.cluster_id,
+    .number(
+        attribute_name=GledoptoColorLoopConfigCluster.AttributeDefs.color_loop_time.name,
+        cluster_id=GledoptoColorLoopConfigCluster.cluster_id,
         endpoint_id=ENDPOINT_ID,
+        min_value=COLOR_LOOP_MIN_TIME,
+        max_value=COLOR_LOOP_MAX_TIME,
+        step=COLOR_LOOP_TIME_STEP,
         unit=UnitOfTime.SECONDS,
-        translation_key="color_loop_speed",
-        fallback_name="Color Loop Speed",
+        translation_key="color_loop_time",
+        fallback_name="Color loop time",
     )
-    .command_button(
-        command_name=GledoptoColorLoopControlCluster.ServerCommandDefs.speed_up.name,
-        cluster_id=GledoptoColorLoopControlCluster.cluster_id,
-        endpoint_id=ENDPOINT_ID,
-        translation_key="color_loop_speed_up",
-        fallback_name="Color Loop Speed +7s",
-        unique_id_suffix="color_loop_speed_up",
-    )
-    .command_button(
-        command_name=GledoptoColorLoopControlCluster.ServerCommandDefs.speed_down.name,
-        cluster_id=GledoptoColorLoopControlCluster.cluster_id,
-        endpoint_id=ENDPOINT_ID,
-        translation_key="color_loop_speed_down",
-        fallback_name="Color Loop Speed -7s",
-        unique_id_suffix="color_loop_speed_down",
-    )
+    .add_to_registry()
 )
-
-builder.add_to_registry()

@@ -572,4 +572,3 @@ class TuyaDINPowerMeasurement(ElectricalMeasurement, TuyaLocalCluster):
     .tuya_enchantment()
     .add_to_registry()
 )
-

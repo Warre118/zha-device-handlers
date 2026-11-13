@@ -3,16 +3,26 @@
 from unittest import mock
 
 import pytest
-from zigpy.zcl import ClusterType, foundation
+from zha.quirks import DEVICE_REGISTRY
+from zigpy.zcl import ClusterType
+from zigpy.zcl.clusters.general import (
+    Basic,
+    Groups,
+    Identify,
+    LevelControl,
+    OnOff,
+    Scenes,
+)
 from zigpy.zcl.clusters.lighting import Color
 
-import zhaquirks.gledopto.glc009
+from zhaquirks.builder import UnitOfTemperature, UnitOfTime
 from zhaquirks.gledopto.glc008p import (
-    COLOR_LOOP_DEFAULT_SECONDS,
-    GledoptoColorLoopControlCluster,
-    GledoptoColorRangeCluster,
-    GledoptoRangeConfigCluster,
+    COLOR_LOOP_DEFAULT_TIME,
+    GledoptoColorCluster,
+    GledoptoColorLoopConfigCluster,
+    GledoptoColorRangeConfigCluster,
 )
+import zhaquirks.gledopto.glc009
 
 
 def test_gledopto_glc009_signature(assert_signature_matches_quirk):
@@ -50,144 +60,221 @@ def test_gledopto_glc009_signature(assert_signature_matches_quirk):
 
 
 @pytest.fixture
-def gledopto_glc008p(zigpy_device_from_v2_quirk):
-    """Return a quirked GL-C-008P with its endpoint 11 clusters."""
-    cluster_ids = {
-        0x0000: ClusterType.Server,
-        0x0003: ClusterType.Server,
-        0x0004: ClusterType.Server,
-        0x0005: ClusterType.Server,
-        0x0006: ClusterType.Server,
-        0x0008: ClusterType.Server,
-        Color.cluster_id: ClusterType.Server,
-        0x1000: ClusterType.Server,
-        0x0019: ClusterType.Client,
-    }
-
+def glc008p(zigpy_device_from_v2_quirk):
+    """Return a quirked GL-C-008P."""
     return zigpy_device_from_v2_quirk(
         "GLEDOPTO",
         "GL-C-008P",
         endpoint_ids=[11],
-        cluster_ids={11: cluster_ids},
+        cluster_ids={
+            11: {
+                Basic.cluster_id: ClusterType.Server,
+                Identify.cluster_id: ClusterType.Server,
+                Groups.cluster_id: ClusterType.Server,
+                Scenes.cluster_id: ClusterType.Server,
+                OnOff.cluster_id: ClusterType.Server,
+                LevelControl.cluster_id: ClusterType.Server,
+                Color.cluster_id: ClusterType.Server,
+            }
+        },
     )
 
 
-def test_gledopto_glc008p_clusters_and_defaults(gledopto_glc008p):
-    """Test GL-C-008P exposes the replacement and local control clusters."""
-    endpoint = gledopto_glc008p.endpoints[11]
+def _set_range(device, warmest_k, coldest_k):
+    config = device.endpoints[11].gledopto_range_config
+    config.update_attribute(config.AttributeDefs.warmest_k.id, warmest_k)
+    config.update_attribute(config.AttributeDefs.coldest_k.id, coldest_k)
 
-    assert isinstance(endpoint.color, GledoptoColorRangeCluster)
-    assert isinstance(endpoint.gledopto_range_config, GledoptoRangeConfigCluster)
+
+def test_glc008p_entities(glc008p):
+    """Test the clusters and configuration entities of the GL-C-008P."""
+    endpoint = glc008p.endpoints[11]
+    assert isinstance(endpoint.light_color, GledoptoColorCluster)
+    assert isinstance(endpoint.gledopto_range_config, GledoptoColorRangeConfigCluster)
     assert isinstance(
-        endpoint.gledopto_color_loop_control,
-        GledoptoColorLoopControlCluster,
+        endpoint.gledopto_color_loop_config, GledoptoColorLoopConfigCluster
     )
 
-    assert endpoint.gledopto_range_config.get("warmest_k") == 2000
-    assert endpoint.gledopto_range_config.get("coldest_k") == 6500
-    assert endpoint.gledopto_color_loop_control.get("color_loop_speed") == (
-        COLOR_LOOP_DEFAULT_SECONDS
+    entry = DEVICE_REGISTRY.match_entry(glc008p)
+    entities = {
+        metadata.resolved_unique_id_suffix: metadata
+        for metadata in entry.zha_device_factory.quirk_definition.entity_metadata
+    }
+    assert set(entities) == {"warmest_k", "coldest_k", "color_loop_time"}
+    assert entities["warmest_k"].unit == UnitOfTemperature.KELVIN
+    assert entities["coldest_k"].unit == UnitOfTemperature.KELVIN
+    assert entities["color_loop_time"].unit == UnitOfTime.SECONDS
+    assert entities["color_loop_time"].step == 7
+
+
+def test_glc008p_default_range_is_transparent(glc008p):
+    """Test that the default range leaves native values unchanged."""
+    color = glc008p.endpoints[11].light_color
+    assert color.get(Color.AttributeDefs.color_temp_physical_min.name) == 154
+    assert color.get(Color.AttributeDefs.color_temp_physical_max.name) == 500
+
+    for mireds in (154, 250, 370, 500):
+        color.update_attribute(Color.AttributeDefs.color_temperature.id, mireds)
+        assert color.get(Color.AttributeDefs.color_temperature.name) == mireds
+
+
+def test_glc008p_configured_range(glc008p):
+    """Test that a configured range is mapped onto the native range."""
+    _set_range(glc008p, 2700, 6500)
+    color = glc008p.endpoints[11].light_color
+
+    assert color.get(Color.AttributeDefs.color_temp_physical_min.name) == 154
+    assert color.get(Color.AttributeDefs.color_temp_physical_max.name) == 370
+
+    color.update_attribute(Color.AttributeDefs.color_temperature.id, 500)
+    assert color.get(Color.AttributeDefs.color_temperature.name) == 370
+    color.update_attribute(Color.AttributeDefs.color_temperature.id, 327)
+    assert color.get(Color.AttributeDefs.color_temperature.name) == 262
+
+
+def test_glc008p_start_up_previous_is_not_mapped(glc008p):
+    """Test that the start-up value for the previous temperature is kept."""
+    _set_range(glc008p, 2700, 6500)
+    color = glc008p.endpoints[11].light_color
+
+    color.update_attribute(Color.AttributeDefs.start_up_color_temperature.id, 0xFFFF)
+    assert color.get(Color.AttributeDefs.start_up_color_temperature.name) == 0xFFFF
+
+
+async def test_glc008p_read_attributes(glc008p):
+    """Test that attribute reads return values in the configured range."""
+    _set_range(glc008p, 2700, 6500)
+    color = glc008p.endpoints[11].light_color
+    color.update_attribute(Color.AttributeDefs.color_temperature.id, 500)
+
+    success, _ = await color.read_attributes(
+        [
+            Color.AttributeDefs.color_temperature.name,
+            Color.AttributeDefs.color_temp_physical_max.name,
+        ],
+        only_cache=True,
     )
+    assert success[Color.AttributeDefs.color_temperature.name] == 370
+    assert success[Color.AttributeDefs.color_temp_physical_max.name] == 370
 
 
-def test_gledopto_glc008p_kelvin_range_mapping(gledopto_glc008p):
-    """Test configurable Kelvin limits are exposed as virtual mired limits."""
-    endpoint = gledopto_glc008p.endpoints[11]
-    config = endpoint.gledopto_range_config
-    color = endpoint.color
-
-    config._update_attribute(config.AttributeDefs.warmest_k.id, 2200)
-    config._update_attribute(config.AttributeDefs.coldest_k.id, 6000)
-
-    assert config.mireds_range == (167, 455)
-    assert color.get(Color.AttributeDefs.color_temp_physical_min) == 167
-    assert color.get(Color.AttributeDefs.color_temp_physical_max) == 455
-
-    color._update_attribute(Color.AttributeDefs.color_temperature.id, 200)
-    assert color.get(Color.AttributeDefs.color_temperature) == 205
-
-
-async def test_gledopto_glc008p_color_loop_speed_inactive(gledopto_glc008p):
-    """Speed changes while Color Loop is inactive return a successful ZCL result."""
-    control = gledopto_glc008p.endpoints[11].gledopto_color_loop_control
-
-    result = await control.command(control.ServerCommandDefs.speed_up.id)
-    assert result.command_id == control.ServerCommandDefs.speed_up.id
-    assert result.status == foundation.Status.SUCCESS
-    assert control.get("color_loop_speed") == 32
-
-    result = await control.command(control.ServerCommandDefs.speed_down.id)
-    assert result.command_id == control.ServerCommandDefs.speed_down.id
-    assert result.status == foundation.Status.SUCCESS
-    assert control.get("color_loop_speed") == 25
-
-
-async def test_gledopto_glc008p_color_loop_speed_active(gledopto_glc008p):
-    """Changing speed while active updates the running Color Loop."""
-    endpoint = gledopto_glc008p.endpoints[11]
-    control = endpoint.gledopto_color_loop_control
-    color = endpoint.color
-
-    color._update_attribute(Color.AttributeDefs.color_loop_active.id, 1)
-    color._update_attribute(Color.AttributeDefs.color_loop_direction.id, 1)
-
-    color_response = foundation.GENERAL_COMMANDS[
-        foundation.GeneralCommand.Default_Response
-    ].schema(
-        command_id=Color.ServerCommandDefs.color_loop_set.id,
-        status=foundation.Status.SUCCESS,
-    )
+async def test_glc008p_write_start_up_color_temperature(glc008p):
+    """Test that start-up writes are mapped, except for the previous value."""
+    _set_range(glc008p, 2700, 6500)
+    color = glc008p.endpoints[11].light_color
+    start_up = Color.AttributeDefs.start_up_color_temperature.name
 
     with mock.patch.object(
-        color,
-        "command",
-        new=mock.AsyncMock(return_value=color_response),
-    ) as color_command:
-        result = await control.command(control.ServerCommandDefs.speed_up.id)
+        Color, "write_attributes", new=mock.AsyncMock()
+    ) as write_attributes:
+        await color.write_attributes({start_up: 370})
+        await color.write_attributes({start_up: 0xFFFF})
 
-    assert result.command_id == control.ServerCommandDefs.speed_up.id
-    assert result.status == foundation.Status.SUCCESS
-    color_command.assert_awaited_once_with(
-        Color.ServerCommandDefs.color_loop_set.id,
-        update_flags=0x05,
-        action=0x02,
-        direction=1,
-        time=32,
-        start_hue=0,
-        manufacturer=None,
-        expect_reply=True,
-    )
+    assert write_attributes.await_args_list[0].args[0] == {start_up: 500}
+    assert write_attributes.await_args_list[1].args[0] == {start_up: 0xFFFF}
 
 
-async def test_gledopto_glc008p_start_uses_saved_color_loop_speed(gledopto_glc008p):
-    """Starting the Color Loop overrides the command time with the saved speed."""
-    endpoint = gledopto_glc008p.endpoints[11]
-    control = endpoint.gledopto_color_loop_control
-    color = endpoint.color
-    control._update_attribute(control.AttributeDefs.color_loop_speed.id, 39)
+async def test_glc008p_color_temp_commands(glc008p):
+    """Test that color temperature commands are mapped to the native range."""
+    _set_range(glc008p, 2700, 6500)
+    color = glc008p.endpoints[11].light_color
 
-    with mock.patch.object(
-        Color,
-        "command",
-        new=mock.AsyncMock(return_value=(None, foundation.Status.SUCCESS)),
-    ) as parent_command:
-        result = await color.command(
-            Color.ServerCommandDefs.color_loop_set.id,
-            update_flags=0x01,
-            action=0x02,
-            direction=0,
-            time=25,
+    with mock.patch.object(Color, "command", new=mock.AsyncMock()) as command:
+        await color.move_to_color_temp(370, 10)
+        await color.step_color_temp(
+            step_mode=Color.StepMode.Up,
+            step_size=55,
+            transition_time=5,
+            color_temp_min_mireds=0,
+            color_temp_max_mireds=370,
+        )
+        await color.move_color_temp(Color.MoveMode.Up, 108, 154, 262)
+
+    assert command.await_args_list[0].kwargs == {
+        "manufacturer": None,
+        "expect_reply": True,
+        "color_temp_mireds": 500,
+        "transition_time": 10,
+    }
+    assert command.await_args_list[1].kwargs == {
+        "manufacturer": None,
+        "expect_reply": True,
+        "step_mode": Color.StepMode.Up,
+        "step_size": 88,
+        "transition_time": 5,
+        "color_temp_min_mireds": 0,
+        "color_temp_max_mireds": 500,
+    }
+    assert command.await_args_list[2].kwargs == {
+        "manufacturer": None,
+        "expect_reply": True,
+        "move_mode": Color.MoveMode.Up,
+        "rate": 173,
+        "color_temp_min_mireds": 154,
+        "color_temp_max_mireds": 327,
+    }
+
+
+async def test_glc008p_color_loop_start_uses_configured_time(glc008p):
+    """Test that starting the color loop uses the configured loop time."""
+    color = glc008p.endpoints[11].light_color
+
+    with mock.patch.object(Color, "command", new=mock.AsyncMock()) as command:
+        await color.color_loop_set(
+            update_flags=Color.ColorLoopUpdateFlags.Action
+            | Color.ColorLoopUpdateFlags.Direction
+            | Color.ColorLoopUpdateFlags.Time,
+            action=Color.ColorLoopAction.Activate_from_current_hue,
+            direction=Color.ColorLoopDirection.Increment,
+            time=7,
+            start_hue=0,
+        )
+        await color.color_loop_set(
+            update_flags=Color.ColorLoopUpdateFlags.Action,
+            action=Color.ColorLoopAction.Deactivate,
+            direction=Color.ColorLoopDirection.Decrement,
+            time=0,
             start_hue=0,
         )
 
-    assert result == (None, foundation.Status.SUCCESS)
-    parent_command.assert_awaited_once_with(
+    assert command.await_args_list[0].kwargs["time"] == COLOR_LOOP_DEFAULT_TIME
+    # Stopping the loop is passed through unchanged
+    assert command.await_args_list[1].kwargs["time"] == 0
+
+
+async def test_glc008p_color_loop_time_inactive(glc008p):
+    """Test that changing the loop time while inactive sends nothing."""
+    config = glc008p.endpoints[11].gledopto_color_loop_config
+
+    with mock.patch.object(Color, "command", new=mock.AsyncMock()) as command:
+        await config.write_attributes({config.AttributeDefs.color_loop_time.name: 11})
+
+    command.assert_not_awaited()
+    assert config.get(config.AttributeDefs.color_loop_time.name) == 11
+
+
+async def test_glc008p_color_loop_time_active(glc008p):
+    """Test that changing the loop time is applied to a running loop."""
+    endpoint = glc008p.endpoints[11]
+    config = endpoint.gledopto_color_loop_config
+    color = endpoint.light_color
+    color.update_attribute(Color.AttributeDefs.color_loop_active.id, 1)
+    color.update_attribute(
+        Color.AttributeDefs.color_loop_direction.id,
+        Color.ColorLoopDirection.Increment,
+    )
+
+    with mock.patch.object(Color, "command", new=mock.AsyncMock()) as command:
+        await config.write_attributes({config.AttributeDefs.color_loop_time.name: 39})
+
+    command.assert_awaited_once_with(
         Color.ServerCommandDefs.color_loop_set.id,
         manufacturer=None,
         expect_reply=True,
-        update_flags=0x05,
-        action=0x02,
-        direction=0,
+        update_flags=Color.ColorLoopUpdateFlags.Action
+        | Color.ColorLoopUpdateFlags.Time,
+        action=Color.ColorLoopAction.Activate_from_current_hue,
+        direction=Color.ColorLoopDirection.Increment,
         time=39,
         start_hue=0,
     )
